@@ -1,0 +1,347 @@
+
+---
+title: "Linebacker I Dashboard, MAY 9 - OCT 23, 1972"
+author: "Cory Lesmeister, The DataMeister"
+date: "`r Sys.Date()`"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    theme: cosmo
+    orientation: rows
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+```
+
+```{r packages, include=FALSE}
+# Required R Packages
+library(flexdashboard)
+library(shinydashboard)
+library(shiny)      # For creating the interactive web application
+library(leaflet)    # For interactive mapping
+library(leaflet.extras) # heatmap
+library(dplyr)      # For data manipulation
+library(ggplot2)    # For additional visualizations
+library(DT)         # For interactive data tables
+library(lubridate)  # For date handling
+library(viridis)    # For colorblind-friendly color palettes
+library(plotly)     # For interactive charts
+```
+
+```{r data_prep, include=FALSE}
+# Load and filter THOR dataset for Operation Linebacker I (May-October 1972)
+
+thor_data <- read.csv("df_lb1.csv")
+
+# Filter for Operation Linebacker I time frame
+thor_data$mission_date <- ymd(thor_data$mission_date)
+# 20,943
+
+# done beforehand, put need to confirm
+linebacker_data <- thor_data %>%
+  filter(mission_date >= "1972-05-09" & mission_date <= "1972-10-23")
+# sorties all are 'Kinetic'
+colnames(linebacker_data)[colnames(linebacker_data) == "tgtlatdd_ddd_wgs84"] <- "lat"
+colnames(linebacker_data)[colnames(linebacker_data) == "tgtlonddd_ddd_wgs84"] <- "lon"
+colnames(linebacker_data)[colnames(linebacker_data) == "valid_aircraft_root"] <- "valid_aircraft"
+  # Step 3: Replace NA in lat with a set latitude
+linebacker_data <- linebacker_data %>%
+  mutate(
+    lat = if_else(is.na(lat), 1.2903, lat),  # set lat
+    lon = if_else(is.na(lon), 103.8519, lon)  # Only replace lon if both were NA
+  )
+
+linebacker_data$tons <- ifelse(linebacker_data$weapontypeweight == 0,
+                               linebacker_data$numweaponsdelivered / 4,
+                               (linebacker_data$numweaponsdelivered * 
+                                 linebacker_data$weapontypeweight / 2000))
+
+# truncate tonnage; F4 can carry 9 tons F105 7 tons
+# identify and create a lookup table of max tonnage per aircraft
+linebacker_data$tons <- ifelse(linebacker_data$tons > 9 & linebacker_data$valid_aircraft != 'B-52', 9, linebacker_data$tons)
+  
+```
+
+Sidebar {.sidebar}
+=====================================
+
+#### Filters
+```{r}
+dateRangeInput("dateRange", "Mission Date Range:",
+               start = "1972-05-09", end = "1972-10-23",
+               min = "1972-05-09", max = "1972-10-23")
+
+checkboxGroupInput("acType", "Aircraft Type:",
+                  choices = sort(unique(linebacker_data$valid_aircraft)),
+                  selected = sort(unique(linebacker_data$valid_aircraft))[2:3])
+
+selectInput("munType", "Munition Type:",
+           choices = c("All", sort(unique(linebacker_data$weapontype))),
+           selected = "All")
+
+selectInput("targetType", "Target Category:",
+           choices = c("All", sort(unique(linebacker_data$tgttype))),
+           selected = "All")
+
+selectInput("svcType", "Military Service:",
+           choices = c("All", sort(unique(linebacker_data$milservice))),
+           selected = "All")
+
+radioButtons("vizType", "Visualization Type:",
+            choices = c("Heat Map", "Point Map", "Time Series"),
+            selected = "Heat Map")
+
+downloadButton("downloadData", "Download Filtered Data")
+```
+
+Map
+=====================================  
+
+Row
+-------------------------------------
+
+### Operation Linebacker I: Interactive Map: Select Heatmap or Point Map in Filters
+
+```{r}
+# Reactive filtered data
+filtered_data <- reactive({
+  data <- linebacker_data %>%
+    filter(mission_date >= input$dateRange[1] & mission_date <= input$dateRange[2]) %>%
+    filter(valid_aircraft %in% input$acType)
+  
+  if (input$targetType != "All") {
+    data <- data %>% filter(tgttype == input$targetType)
+  }
+  
+  if (input$munType != "All") {
+    data <- data %>% filter(weapontype == input$munType)
+  }
+  
+  if (input$svcType != "All") {
+    data <- data %>% filter(milservice == input$svcType)
+  }
+  
+  data
+})
+
+# Map output
+renderLeaflet({
+  data <- filtered_data()
+  
+  # Create map with all basemap options pre-loaded
+  map <- leaflet(data) %>%
+    # Add all basemap options
+    addTiles(group = "OpenStreetMap") %>%
+    addProviderTiles("Esri.WorldImagery", group = "Satellite") %>%
+    addProviderTiles("Esri.WorldTopoMap", group = "Topographic") %>%
+    addProviderTiles("OpenTopoMap", group = "OpenTopoMap") %>%
+    
+    
+    # Add layer controls directly on the map
+    addLayersControl(
+      baseGroups = c("OpenStreetMap", 
+                    "Satellite", "Topographic", "OpenTopoMap"),
+      options = layersControlOptions(collapsed = FALSE)
+    )
+  
+  if (input$vizType == "Heat Map") {
+    map %>%
+      addHeatmap(lng = ~lon, lat = ~lat, 
+                 intensity = ~tons,
+                 radius = 10, blur = 2)
+  } else {
+    map %>%
+      addMarkers(lng = ~lon, lat = ~lat,
+                 popup = ~paste("<b>Date:</b>", mission_date, "<br>",
+                                "<b>Aircraft:</b>", valid_aircraft, "<br>",
+                                "<b>Number Aircraft:</b>", numofacft, "<br>",
+                                #"<b>Unit:</b>", unit, "<br>",
+                                "<b>Callsign:</b>", callsign, "<br>",
+                                "<b>Weapons:</b>", weapontype, "<br>",
+                                "<b>Origin:</b>", takeofflocation, "<br>"))
+  }
+})
+
+
+```
+
+Statistics
+=====================================
+
+Row
+-------------------------------------
+
+### Mission Statistics
+
+```{r}
+# Stats output
+renderPlotly({
+  data <- filtered_data()
+  if (nrow(data) == 0) return(NULL)
+  
+  if (input$vizType == "Time Series") {
+    daily_counts <- data %>%
+      group_by(mission_date) %>%
+      summarize(Sorties = sum(numofacft), Estimated_Tonnage = sum(tons, na.rm = TRUE))
+    
+    plot_ly(daily_counts, x = ~mission_date) %>%
+      add_lines(y = ~Sorties, name = "Sorties") %>%
+      add_lines(y = ~Estimated_Tonnage, name = "Tonnage", yaxis = "y2") %>%
+      layout(
+        title = "Sorties and Estimated Tonnage",
+        yaxis = list(title = "Sorties", rangemode = "tozero", range = c(0, max(daily_counts$Sorties, na.rm = TRUE) * 1.1)),
+        yaxis2 = list(title = "Tonnage", overlaying = "y", side = "right")
+      )
+  } else {
+    ac_summary <- data %>%
+      group_by(valid_aircraft) %>%
+      summarize(Sorties = sum(numofacft), Estimated_Tonnage = sum(tons, na.rm = TRUE))
+    
+    plot_ly(ac_summary, x = ~valid_aircraft) %>%
+      add_bars(y = ~Sorties, name = "Sorties") %>%
+      add_bars(y = ~Estimated_Tonnage, name = "Tonnage") %>%
+      layout(
+        title = "Sorties and Estimated Tonnage",
+        barmode = "group", # Side-by-side bars instead of stacked
+        yaxis = list(title = "Sorties and Tonnage", rangemode = "tozero", range = c(0, max(ac_summary$Sorties, na.rm = TRUE) * 1.1)),
+        xaxis = list(categoryorder = "total descending")
+      )
+  }
+})
+
+```
+
+Data Table
+=====================================
+
+Row
+-------------------------------------
+
+### Mission Data
+
+```{r}
+# Data table output
+renderDT({
+  filtered_data() %>%
+    select(mission_date, valid_aircraft, tgttype, weapontype, tons, lon, lat) %>%
+    datatable(options = list(pageLength = 10))
+})
+
+# Download handler
+output$downloadData <- downloadHandler(
+  filename = function() { paste("linebacker_data_", Sys.Date(), ".csv", sep = "") },
+  content = function(file) { write.csv(filtered_data(), file, row.names = FALSE) }
+)
+```
+
+Compare
+=====================================
+
+Row
+-------------------------------------
+
+### Selection A {.col-md-6}
+
+```{r}
+dateRangeInput("dateRangeA", "Date Range A:",
+              start = "1972-05-09", end = "1972-10-23")
+
+selectInput("acTypeA", "Aircraft Type A:",
+           choices = sort(unique(linebacker_data$valid_aircraft)),
+           selected = sort(unique(linebacker_data$valid_aircraft))[3])
+
+# Comparison tab logic
+filtered_data_a <- reactive({
+  linebacker_data %>%
+    filter(mission_date >= input$dateRangeA[1] & mission_date <= input$dateRangeA[2]) %>%
+    filter(valid_aircraft == input$acTypeA)
+})
+
+renderPlotly({
+  data <- filtered_data_a()
+  if (nrow(data) == 0) return(NULL)
+  
+  daily_counts <- data %>%
+    group_by(mission_date) %>%
+    summarize(Sorties = sum(numofacft, na.rm = TRUE))
+  
+  plot_ly(daily_counts, x = ~mission_date, y = ~Sorties, type = "scatter", mode = "lines") %>%
+    layout(
+      title = "Selection A: Daily Missions",
+      xaxis = list(title = "Date", type = "date"),
+      yaxis = list(
+        title = "Sorties",
+        rangemode = "tozero",
+        zeroline = TRUE,
+        zerolinewidth = 2,
+        zerolinecolor = "#000000",
+        range = c(0, max(daily_counts$Sorties, na.rm = TRUE) * 1.1) # Ensure y-axis starts at zero
+      )
+    )
+})
+
+```
+
+### Selection B {.col-md-6}
+
+```{r}
+dateRangeInput("dateRangeB", "Date Range B:",
+              start = "1972-05-09", end = "1972-10-23")
+
+selectInput("acTypeB", "Aircraft Type B:",
+           choices = sort(unique(linebacker_data$valid_aircraft)),
+           selected = sort(unique(linebacker_data$valid_aircraft))[4])
+
+filtered_data_b <- reactive({
+  linebacker_data %>%
+    filter(mission_date >= input$dateRangeB[1] & mission_date <= input$dateRangeB[2]) %>%
+    filter(valid_aircraft == input$acTypeB)
+})
+
+renderPlotly({
+  data <- filtered_data_b()
+  if (nrow(data) == 0) return(NULL)
+  
+  daily_counts <- data %>%
+    group_by(mission_date) %>%
+    summarize(Sorties = sum(numofacft, na.rm = TRUE))
+  
+  plot_ly(daily_counts, x = ~mission_date, y = ~Sorties, type = "scatter", mode = "lines") %>%
+    layout(
+      title = "Selection A: Daily Missions",
+      xaxis = list(title = "Date", type = "date"),
+      yaxis = list(
+        title = "Sorties",
+        rangemode = "tozero",
+        zeroline = TRUE,
+        zerolinewidth = 2,
+        zerolinecolor = "#000000",
+        range = c(0, max(daily_counts$Sorties, na.rm = TRUE) * 1.1) # Ensure y-axis starts at zero
+      )
+    )
+})
+```
+
+About
+=====================================
+
+Row
+-------------------------------------
+
+### About This Visualization
+
+#### Filters
+On the interactive map, we recommend filtering the dates to no more than a month before looking at the "Point Map". The filter for "Time Series" is only applied to the Statistics tab.
+
+This interactive dashboard visualizes bombing missions during Operation Linebacker I (May 9 - October 23, 1972) using the declassified THOR (Theater History of Operations Reports) data.
+
+Use the sidebar filters to explore different aspects of the air campaign. The map shows the geographic distribution of bombing missions, while the Statistics tab provides aggregate metrics.
+
+This tool is provided exclusively for Patreon supporters. Thank you for supporting data-driven historical research.
+
+#### Data Source
+THOR Dataset: Theater History of Operations Reports, United States Air Force
